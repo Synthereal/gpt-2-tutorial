@@ -237,11 +237,20 @@ class GPT(nn.Module):
 num_return_sequences = 5
 max_length = 30
 
+# load ROCm through CUDA
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+    print(f"Device name: {torch.cuda.get_device_name(0)}")
+else:
+    device = torch.device("cpu")
+    print("CUDA (ROCm) not available, falling back to CPU.")
+
 model = GPT.from_pretrained('gpt2')
 # good practice put model to evaluation mode when not training
 model.eval() # here it does nothing though
-# TODO: model to ROCm
-model.to('cuda') # i don't have cuda :(
+# move model to device
+model.to(device)
+
 
 # prefix tokens
 import tiktoken
@@ -281,7 +290,6 @@ while x.size(1) < max_length:
 for i in range(num_return_sequences):
     tokens = x[i, :max_length].tolist()
     decoded = enc.decode(tokens)
-    print(">", decoded)
+    print(">", decode)
 
-
-# so we're not using cuda
+    # so we're not using cuda
