@@ -246,6 +246,7 @@ else:
     print("CUDA (ROCm) not available, falling back to CPU.")
 
 model = GPT.from_pretrained('gpt2')
+# model = GPT(GPTConfig())
 # good practice put model to evaluation mode when not training
 model.eval() # here it does nothing though
 # move model to device
