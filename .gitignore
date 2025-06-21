@@ -1,0 +1,6 @@
+# Python virtual environments
+.venv/
+.venv_wsl/
+
+# PyTorch ROCm wheel downloads
+*.whl
