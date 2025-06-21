@@ -158,7 +158,7 @@ class GPT(nn.Module):
 
     
     # allows to generate text
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
 
         # idx is shape (B, T)
         B, T = idx.size()
@@ -178,7 +178,14 @@ class GPT(nn.Module):
         # with input (B, T), calculate next token (B, T+1)
         # vocab_size = number of possible tokens
         logits = self.lm_head(x) # (B, T, vocab_size)
-        return logits
+
+        # calculate loss
+        loss = None
+        if targets is not None:
+            # cross entropy loss function from pytorch
+            # cross entropy cannot take multi dimensional tensors, so we flatten to 2d
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
 
 
     @classmethod
@@ -231,27 +238,112 @@ class GPT(nn.Module):
         return model
     
 
+import tiktoken
+
+# loads data into chunks and iterates over document
+# each epoch is iteration over entire document
+class DataLoaderLite:
+
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        # at init load tokens from disk and store in memory
+        dataset = 'datasets/tiny_shakespeare.txt'
+        with open(dataset, 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+
+        # state
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        # buffer of batch collection + 1
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:].view(B, T)) # targets
+        # advance position in tensor
+        self.current_position += B * T
+        # if loading next batch would be out of bounds, reset
+        if self.current_position + (B * T + 1) > len(self.tokens):
+            self.current_position = 0
+        
+        return x, y
+
 
 # -------------------------------------
 
 num_return_sequences = 5
 max_length = 30
 
-# load ROCm through CUDA
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-    print(f"Device name: {torch.cuda.get_device_name(0)}")
-else:
-    device = torch.device("cpu")
-    print("CUDA (ROCm) not available, falling back to CPU.")
 
-model = GPT.from_pretrained('gpt2')
-# model = GPT(GPTConfig())
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+# new gen apple cpu
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps"
+print(f"using device: {device}")
+# device = "cpu" # OVERRIDE
+
+# get a data batch
+# import tiktoken
+# dataset = 'datasets/tiny_shakespeare.txt'
+# enc = tiktoken.get_encoding('gpt2')
+# with open(dataset, 'r') as f:
+#     text = f.read()
+# text = text[:1000]
+# tokens = enc.encode(text)
+# B, T = 4, 32 # (4 batches, 32 tokens per row)
+# # take buffer of 
+# buf = torch.tensor(tokens[:B*T + 1])
+# # to device makes a copy
+# buf = buf.to(device) # MUST SET buf = new instance of buf on new device
+# # creates input buffer
+# x = buf[:-1].view(B, T)
+# # creates label buffer, offset from input by 1 index
+# # displays the next token in each index
+# y = buf[1:].view(B, T)
+
+# initialize first training batch
+train_loader = DataLoaderLite(B=4, T=32)
+
+# model = GPT.from_pretrained('gpt2')
+model = GPT(GPTConfig())
 # good practice put model to evaluation mode when not training
-model.eval() # here it does nothing though
+# model.eval() # here it does nothing though
 # move model to device
 model.to(device)
+# calculate logits and loss in nn.module forward pass
+# pass in input and labels
+# logits, loss = model(x, y)
 
+# aim not to favor any token too much at initialization
+# if 50257 potential tokens, 1 should have probabilitiy of 1/50257
+# thus, loss ~ -ln(1/50257) ~ 10.825
+# must check before training
+
+# optimizer step in pytorch
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4) # 3e-4 default learning rate for debugging
+# backward pass
+for i in range(50):
+    # get next batch
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad() # reset gradients for backward pass
+    logits, loss = model(x, y)
+    loss.backward() # deposits gradients, must equal zero
+    optimizer.step() # updates parameters and decrease loss
+    # loss is single value tensor living on device
+    # calling .item ships 1D tensor back to cpu who converts into float 
+    print(f"step {i}, loss: {loss.item()}")
+
+import sys; sys.exit(0)
 
 # prefix tokens
 import tiktoken
