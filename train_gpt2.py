@@ -290,6 +290,4 @@ while x.size(1) < max_length:
 for i in range(num_return_sequences):
     tokens = x[i, :max_length].tolist()
     decoded = enc.decode(tokens)
-    print(">", decode)
-
-    # so we're not using cuda
+    print(">", decoded)
