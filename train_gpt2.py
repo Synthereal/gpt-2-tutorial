@@ -42,6 +42,7 @@ class CasualSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1 # set scale flag (kinda jank)
         # regularization
         self.n_head = config.n_head # number of heads
         self.n_embd = config.n_embd # dimensionality of token
@@ -107,6 +108,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh') # activation function, tanh approx uncommon but used for gpt 2
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1 # set scale flag (kinda jank)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -156,6 +158,31 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+        # weight sharing scheme
+        # INPUT TOKENS AND OUTPUT HEAD SHARE WEIGHT
+        # semantically similar tokens will have similar weights
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # init params
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        # if module is object of nn.Linear class
+        if isinstance(module, nn.Linear):
+            # DEFAULT mean = 0, standard deviation = 0.02, bias = 0
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                # 2* because each layer has 2 blocks that add together (attn, mlp)
+                # typical javier initialization sets std = 1/sqrt(incoming features into layer)
+                # helps maintain reasonable scaling (~1) as model trains
+                std *= (2 * self.config.n_layer) ** -0.5
+            # 0.02 is roughly in vicinity, so hard coded here ok
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            # bias not 0 by default
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
     # allows to generate text
     def forward(self, idx, targets=None):
@@ -278,6 +305,8 @@ class DataLoaderLite:
 
 # -------------------------------------
 
+import time
+
 num_return_sequences = 5
 max_length = 30
 
@@ -310,8 +339,12 @@ print(f"using device: {device}")
 # # displays the next token in each index
 # y = buf[1:].view(B, T)
 
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
 # initialize first training batch
-train_loader = DataLoaderLite(B=4, T=32)
+train_loader = DataLoaderLite(B=8, T=512)
 
 # model = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig())
@@ -332,6 +365,8 @@ model.to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4) # 3e-4 default learning rate for debugging
 # backward pass
 for i in range(50):
+    t0 = time.time() # start iteration timer
+
     # get next batch
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
@@ -339,9 +374,16 @@ for i in range(50):
     logits, loss = model(x, y)
     loss.backward() # deposits gradients, must equal zero
     optimizer.step() # updates parameters and decrease loss
+
+    # cpu default directs task to gpu and then moves on
+    # sync with gpu before stopping clock
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0) * 1000 # convert to ms
+
     # loss is single value tensor living on device
     # calling .item ships 1D tensor back to cpu who converts into float 
-    print(f"step {i}, loss: {loss.item()}")
+    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms")
 
 import sys; sys.exit(0)
 
