@@ -4,7 +4,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import math
 
-class CasualSelfAttention(nn.Module):
+class CausalSelfAttention(nn.Module):
 
     """
     See "Let's build the GPT Tokenizer" video for context.
@@ -20,7 +20,7 @@ class CasualSelfAttention(nn.Module):
     - split qkv projections into n_head smaller "attention heads", focus on different aspects of x
     - calc attention scores, for each q compute how relevant it is to every other k in sequence
         - typically done via dot product
-    - apply casual masking, crucial for casual (or causal) self-attention, prevents tokens from attending future tokens
+    - apply causal masking, crucial for causal self-attention, prevents tokens from attending future tokens
         - here we use tril, future values = -inf
     - normalize scores with softmax function, turns relevance scores into probability distribution
         - indicates how much "attention" should be placed on each token
@@ -47,7 +47,7 @@ class CasualSelfAttention(nn.Module):
         self.n_head = config.n_head # number of heads
         self.n_embd = config.n_embd # dimensionality of token
         # more of a mask than 'bias', but following HF naming
-        # bias is the "casual mask" used to prevent attention to future tokens
+        # bias is the "causal mask" used to prevent attention to future tokens
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                              .view(1, 1, config.block_size, config.block_size))
         
@@ -69,26 +69,39 @@ class CasualSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # attention (materializes the large (T, T) matrix for all queries and keys)
+        
+        # """ Initial Attention """
 
-        # scaled dot-product attention calculation
-        # k.transpose swaps last 2 dimensions -> (B, nh, hs, T)
-        # q @ new k performs batch matrix multiplication, contains raw attention scores
-        # att[b, h, i, j] = how much query q at i (for b and h) attends to key k at j
-        # (1.0 / math.sqrt(k.size(-1))) is scaling factor, k.size(-1) = hs
-        # prevents dot products from becoming too large, helps softmax gradients
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        # autoregressive mask ensures tokens only draw from previous tokens
-        # masked_fill replaces all instances of 0 with -inf
-        # self.bias[: = take all, :T = take from 0 to (excluding) T], T = current sequence length
-        # -inf becomes 0 after softmax is applied
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        # softmax function along last dimension (T)
-        # converts raw attention scores into probability distribution
-        # sum of all weights in query q = 1
-        att = F.softmax(att, dim=-1)
+        # # scaled dot-product attention calculation
+        # # k.transpose swaps last 2 dimensions -> (B, nh, hs, T)
+        # # q @ new k performs batch matrix multiplication, contains raw attention scores
+        # # att[b, h, i, j] = how much query q at i (for b and h) attends to key k at j
+        # # (1.0 / math.sqrt(k.size(-1))) is scaling factor, k.size(-1) = hs
+        # # prevents dot products from becoming too large, helps softmax gradients
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # # autoregressive mask ensures tokens only draw from previous tokens
+        # # masked_fill replaces all instances of 0 with -inf
+        # # self.bias[: = take all, :T = take from 0 to (excluding) T], T = current sequence length
+        # # -inf becomes 0 after softmax is applied
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # # softmax function along last dimension (T)
+        # # converts raw attention scores into probability distribution
+        # # sum of all weights in query q = 1
+        # att = F.softmax(att, dim=-1)
 
-        # result y = weighted sum of v vectors for each q, incorporating new context
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # # result y = weighted sum of v vectors for each q, incorporating new context
+        # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        # """ FlashAttention """
+        # OK SEEMS TO ONLY BE WORKING FOR NVIDIA (AGAIN)
+        # run using: TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 python3 train_gpt2.py
+        # turns attention into kernel fusion operation
+        # supposedly 7.6x faster by respecting memory hierarchy
+        # N x N matrix never gets materialized in HBM
+        # Online rewrite of softmax algorithm allows for stored variables to speed up entire calculation
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+
         # transpose (B, nh, T, hs) -> (B, T, nh, hs)
         # contiguous = sharing border in memory, stored continuously
         # view(B, T, C) concatenates outputs from all nh attention heads along last dimension 
@@ -122,7 +135,7 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = CasualSelfAttention(config)
+        self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
@@ -137,6 +150,8 @@ class GPTConfig:
     """
     modeled after hf transformer library
     """
+
+    # keep your numbers nice, many powers of 2
     
     block_size: int = 1024 # max sequence length
     vocab_size: int = 50257 # number of tokens: 50k BPE merges + 256 hyte tokens + 1 <|endoftext|>
@@ -350,7 +365,7 @@ train_loader = DataLoaderLite(B=8, T=512)
 # torch.set_float32_matmul_precision('high') # enable tensor 32
 
 # model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 # good practice put model to evaluation mode when not training
 # model.eval() # here it does nothing though
 # move model to device
@@ -359,13 +374,25 @@ model.to(device)
 # pass in input and labels
 # logits, loss = model(x, y)
 
+# compiler for neural networks
+# costs compilation time, but increases speed of calculations, reduces individual read/write overhead
+# like a c compiler but for neural network, introduces kernel fusion
+# prevents vram travel time (common bottleneck) by combining likewise operations in gpu cores
+# read and write once for extensive calculations isntead of round trip for each operation
+# i.e. (a * b) + c becomes 1 operation instead of 2
+# chips in gpu cores have memory, but majority of gpu memory is in hbm (vram) 
+model = torch.compile(model)
+
 # aim not to favor any token too much at initialization
 # if 50257 potential tokens, 1 should have probabilitiy of 1/50257
 # thus, loss ~ -ln(1/50257) ~ 10.825
 # must check before training
 
 # optimizer step in pytorch
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4) # 3e-4 default learning rate for debugging
+# lr=3e-4, eps=1e-8 default for debugging
+# betas=(0.9, 0.95) found in gpt-3 paper
+# learning rate has cosine decay at 10% also from gpt-3 paper
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 # backward pass
 for i in range(50):
     t0 = time.time() # start iteration timer
@@ -380,6 +407,9 @@ for i in range(50):
         logits, loss = model(x, y)
 
     loss.backward() # deposits gradients, must equal zero
+    # clips global norm of gradient to 1.0
+    # prevents model from getting shocked by too large magnitudes
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step() # updates parameters and decrease loss
 
     # cpu default directs task to gpu and then moves on
@@ -391,7 +421,7 @@ for i in range(50):
 
     # loss is single value tensor living on device
     # calling .item ships 1D tensor back to cpu who converts into float 
-    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
+    print(f"step {i}, loss: {loss.item()}, norm: {norm:.4f}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
 
 import sys; sys.exit(0)
 
