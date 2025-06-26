@@ -346,6 +346,9 @@ if torch.cuda.is_available():
 # initialize first training batch
 train_loader = DataLoaderLite(B=8, T=512)
 
+# seems to be nvidia architecture specific data type
+# torch.set_float32_matmul_precision('high') # enable tensor 32
+
 # model = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig())
 # good practice put model to evaluation mode when not training
@@ -371,7 +374,11 @@ for i in range(50):
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad() # reset gradients for backward pass
-    logits, loss = model(x, y)
+    
+    # autocast with mixed precision for bf16
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
+
     loss.backward() # deposits gradients, must equal zero
     optimizer.step() # updates parameters and decrease loss
 
@@ -380,10 +387,11 @@ for i in range(50):
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000 # convert to ms
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
 
     # loss is single value tensor living on device
     # calling .item ships 1D tensor back to cpu who converts into float 
-    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms")
+    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
 
 import sys; sys.exit(0)
 
