@@ -278,12 +278,38 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
+
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # start with all of the candidate parameters (that require grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. any parameters that are 2d will be weight decayed, otherwise no
+        # i.e. weight tensors in matmuls + embeddings decay, biases and layernorms no
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # create AdamW optimizer and use the fused version if available
+        import inspect; fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
+
+
     
 
 import tiktoken
 
 # loads data into chunks and iterates over document
 # each epoch is iteration over entire document
+# each chunk read is ineligible to be read again until next epoch
 class DataLoaderLite:
 
     def __init__(self, B, T):
@@ -388,13 +414,32 @@ model = torch.compile(model)
 # thus, loss ~ -ln(1/50257) ~ 10.825
 # must check before training
 
-# optimizer step in pytorch
+# learning rate has cosine decay from gpt-3 paper
+max_lr = 6e-4
+min_lr = max_lr * 0.1 # 10%
+warmup_steps = 10
+max_steps = 50
+def get_lr(it):
+    # 1. linear warmup for warmup_iters steps
+    if it < warmup_steps:
+        return max_lr * (it+1) / warmup_steps
+    # 2. if it > lr_decay_iters, return min learning rate
+    if it > max_steps:
+        return min_lr
+    # 3. in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 then goes to 0
+    return min_lr + coeff * (max_lr - min_lr)
+
+# optimizer set up in pytorch
 # lr=3e-4, eps=1e-8 default for debugging
-# betas=(0.9, 0.95) found in gpt-3 paper
-# learning rate has cosine decay at 10% also from gpt-3 paper
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+# betas=(0.9, 0.95) also found in gpt-3 paper
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+
 # backward pass
-for i in range(50):
+for step in range(max_steps):
     t0 = time.time() # start iteration timer
 
     # get next batch
@@ -410,6 +455,10 @@ for i in range(50):
     # clips global norm of gradient to 1.0
     # prevents model from getting shocked by too large magnitudes
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    # determine and set learning rate for this iteration
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr # set learning rate
     optimizer.step() # updates parameters and decrease loss
 
     # cpu default directs task to gpu and then moves on
@@ -421,7 +470,7 @@ for i in range(50):
 
     # loss is single value tensor living on device
     # calling .item ships 1D tensor back to cpu who converts into float 
-    print(f"step {i}, loss: {loss.item()}, norm: {norm:.4f}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
+    print(f"step {step:4d}, loss: {loss.item():.6f}, norm: {norm:.4f}, lr {lr:.4e}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
 
 import sys; sys.exit(0)
 
